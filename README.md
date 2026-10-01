@@ -4,7 +4,9 @@ An expansion on Rachel Gordon's GANCM CT-to-MRI synthesis work.
 
 # Model
 
-Standard DDPM. A noise scheduler with gaussian diffusion for the forward process, a U-Net neural network for the back process. A DDIM is used for the sampling, speeding up the process.
+Standard DDPM. A noise scheduler with gaussian diffusion for the forward process, a U-Net neural network for the back process. We use a Deterministic DDIM sampler for quicker previews.
+
+Note: Nothing regarding Polaris has been implemented yet. This should be done before experimentation begins.
 
 # Preprocessing
 
