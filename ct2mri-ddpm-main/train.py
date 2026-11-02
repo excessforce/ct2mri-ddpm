@@ -1,145 +1,185 @@
-"""Train the conditional DDPM (CT -> MRI) on one cross-validation fold.
-
-    python train.py --data_path /path/to/prefix_fold --fold 5 --exp_name ddpm_ct2mri
-
---data_path is the file prefix: files are {data_path}{i}.npz (same as the old flags.data_path).
-Outputs go to runs/<exp_name>/fold<k>/ : args.json, log.csv, ckpt.pt, samples/
 """
-import argparse
-import contextlib
-import copy
+Train the conditional diffusion model (CT -> MRI).
+
+    python train.py
+
+All settings come from config.py. Outputs go to runs/<EXP_NAME>/:
+    checkpoints/last.pt   overwritten every CKPT_EVERY epochs (used to resume)
+    checkpoints/best.pt   lowest validation MAE on the sampled validation subset
+    checkpoints/final.pt  weights after the last epoch
+    samples/              CT | rMRI | sMRI figures from each validation run
+    train_log.csv         per-epoch losses and validation metrics
+"""
+
 import csv
-import json
-import os
-import random
+import math
 import time
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
 
-from dataset import build_fold_datasets, make_loader
-from ddpm_main import GaussianDiffusion, UNet
+import config
+import utils
+from data_loader import build_condition, get_dataloaders
+from losses import DiffusionLoss
+from metrics import image_metrics
+from unet import build_unet
 
 
-def get_args(argv=None):
-    p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--data_path", required=True, help="fold file prefix; files are {prefix}{i}.npz")
-    p.add_argument("--fold", type=int, default=5, help="held-out fold (the old --test_fold)")
-    p.add_argument("--exp_name", default="ddpm_ct2mri")
-    p.add_argument("--out_dir", default="runs")
-    p.add_argument("--input_range", type=float, nargs=2, default=[-1.0, 1.0],
-                   help="value range stored in the .npz files")
-    p.add_argument("--image_size", type=int, default=256)
-    p.add_argument("--aug", action="store_true", help="random flips / rot90 (off by default)")
-    # model / diffusion
-    p.add_argument("--base_channels", type=int, default=32)
-    p.add_argument("--timesteps", type=int, default=1000)
-    # optimisation
-    p.add_argument("--epochs", type=int, default=500)
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--ema_decay", type=float, default=0.999)
-    p.add_argument("--amp", action="store_true", help="bfloat16 autocast on CUDA")
-    p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--seed", type=int, default=42)
-    # monitoring
-    p.add_argument("--sample_every", type=int, default=10, help="epochs between preview grids")
-    p.add_argument("--save_every", type=int, default=10, help="epochs between checkpoints")
-    p.add_argument("--preview_steps", type=int, default=50, help="DDIM steps for previews")
-    p.add_argument("--resume", action="store_true")
-    return p.parse_args(argv)
+def lr_lambda(total_steps):
+    def fn(step):
+        if step < config.WARMUP_STEPS:
+            return (step + 1) / config.WARMUP_STEPS
+        if config.LR_SCHEDULE == "cosine":
+            progress = (step - config.WARMUP_STEPS) / max(1, total_steps - config.WARMUP_STEPS)
+            return 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+        return 1.0
+    return fn
 
 
-def save_preview(path, ct, gt, pred):
-    """Rows = samples, columns = CT | real MRI | synthetic MRI. Inputs (B,1,H,W) in [-1,1]."""
-    rows = [torch.cat([c, g, p], dim=-1) for c, g, p in zip(ct, gt, pred)]
-    grid = torch.cat(rows, dim=-2)[0].cpu().numpy()
-    plt.imsave(path, (grid + 1) / 2, cmap="gray", vmin=0, vmax=1)
+def diffusion_step(model, batch, scheduler, loss_fn, device, generator=None):
+    """Noise the MRI at random timesteps and return the denoising loss."""
+    x0 = batch["mri"].to(device, non_blocking=True)
+    cond = build_condition(batch).to(device, non_blocking=True)
+
+    t = scheduler.sample_timesteps(x0.shape[0], device, generator)
+    noise = torch.randn(x0.shape, device=device, generator=generator)
+    x_t = scheduler.add_noise(x0, noise, t)
+
+    with utils.autocast(device):
+        pred = model(torch.cat([x_t, cond], dim=1), t)
+    return loss_fn(pred, scheduler.get_target(x0, noise, t), t)
 
 
 @torch.no_grad()
-def ema_update(ema, model, decay):
-    for pe, p in zip(ema.parameters(), model.parameters()):
-        pe.lerp_(p, 1 - decay)
+def validation_loss(model, loader, scheduler, loss_fn, device):
+    """Denoising loss on the test fold with fixed timesteps/noise so epochs are comparable."""
+    model.eval()
+    generator = torch.Generator(device=device).manual_seed(config.SEED)
+    total, count = 0.0, 0
+    for batch in loader:
+        n = batch["mri"].shape[0]
+        total += diffusion_step(model, batch, scheduler, loss_fn, device, generator).item() * n
+        count += n
+    model.train()
+    return total / count
+
+
+@torch.no_grad()
+def validation_samples(ema_model, dataset, scheduler, device, epoch):
+    """Sample a fixed, evenly spaced subset of the test fold and report pixel metrics."""
+    n = min(config.VAL_NUM_SAMPLES, len(dataset))
+    indices = torch.linspace(0, len(dataset) - 1, n).long().tolist()
+    batch = torch.utils.data.default_collate([dataset[i] for i in indices])
+    cond = build_condition(batch).to(device)
+    real = batch["mri"].to(device)
+
+    generator = torch.Generator(device=device).manual_seed(config.SEED)
+    fakes = []
+    with utils.autocast(device):
+        for chunk in cond.split(config.EVAL_BATCH_SIZE):
+            fakes.append(scheduler.sample(ema_model, chunk, config.SAMPLER, config.SAMPLING_STEPS,
+                                          config.DDIM_ETA, generator, config.IMG_CHANNELS))
+    fake = torch.cat(fakes)
+
+    k = config.NUM_PLOT_SAMPLES
+    utils.save_comparison(config.SAMPLE_DIR / f"epoch_{epoch:04d}.png",
+                          batch["ct"][:k], real[:k], fake[:k])
+    return {name: values.mean().item() for name, values in image_metrics(real, fake).items()}
 
 
 def main():
-    args = get_args()
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    utils.seed_everything(config.SEED)
+    device = utils.get_device()
+    utils.make_dirs()
+    utils.save_config_snapshot(config.RUN_DIR / "config.json")
+    print(f"Experiment: {config.EXP_NAME} | device: {device}")
+    print(f"Data: {config.DATA_PATH_PREFIX}[{''.join(map(str, config.TRAIN_FOLDS))}].npz, "
+          f"test fold {config.TEST_FOLD}")
 
-    run_dir = os.path.join(args.out_dir, args.exp_name, f"fold{args.fold}")
-    os.makedirs(os.path.join(run_dir, "samples"), exist_ok=True)
-    with open(os.path.join(run_dir, "args.json"), "w") as f:
-        json.dump(vars(args), f, indent=2)
+    train_loader, test_loader = get_dataloaders()
+    print(f"Train slices: {len(train_loader.dataset)} | test slices: {len(test_loader.dataset)}")
 
-    aug = {} if args.aug else dict(p_flip_h=0.0, p_flip_v=0.0, p_rot90=0.0)
-    train_ds, _, test_ds = build_fold_datasets(
-        args.data_path, args.fold, input_range=tuple(args.input_range),
-        image_size=args.image_size, **aug)
-    loader = make_loader(train_ds, args.batch_size, train=True, num_workers=args.num_workers)
-    print(f"train slices: {len(train_ds)} | held-out slices: {len(test_ds)} | device: {dev}")
+    scheduler = utils.build_scheduler()
+    loss_fn = DiffusionLoss(scheduler, config.LOSS_TYPE, config.MIN_SNR_GAMMA)
 
-    ddpm = GaussianDiffusion(UNet(base=args.base_channels), args.timesteps).to(dev)
-    ema = copy.deepcopy(ddpm).eval().requires_grad_(False)
-    opt = torch.optim.AdamW(ddpm.parameters(), lr=args.lr, weight_decay=0.0)
-    print(f"parameters: {sum(p.numel() for p in ddpm.parameters()) / 1e6:.1f}M")
+    model = build_unet().to(device)
+    ema = utils.EMA(model, config.EMA_DECAY)
+    print(f"UNet parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
 
-    ckpt_path = os.path.join(run_dir, "ckpt.pt")
-    start = 0
-    if args.resume and os.path.exists(ckpt_path):
-        ck = torch.load(ckpt_path, map_location=dev)
-        ddpm.load_state_dict(ck["ddpm"])
-        ema.load_state_dict(ck["ema"])
-        opt.load_state_dict(ck["opt"])
-        start = ck["epoch"]
-        print(f"resumed from epoch {start}")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE,
+                                  weight_decay=config.WEIGHT_DECAY)
+    total_steps = config.EPOCHS * len(train_loader)
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda(total_steps))
 
-    log_path = os.path.join(run_dir, "log.csv")
-    if not os.path.exists(log_path):
+    start_epoch, step, best_mae = 0, 0, float("inf")
+    last_path = config.CHECKPOINT_DIR / "last.pt"
+    if config.RESUME and last_path.exists():
+        ckpt = utils.load_checkpoint(last_path, device)
+        model.load_state_dict(ckpt["model"])
+        ema.model.load_state_dict(ckpt["ema"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
+        start_epoch, step, best_mae = ckpt["epoch"] + 1, ckpt["step"], ckpt["best_metric"]
+        print(f"Resumed from {last_path} at epoch {start_epoch}")
+
+    train_model = torch.compile(model) if config.USE_COMPILE else model
+
+    log_path = config.RUN_DIR / "train_log.csv"
+    log_fields = ["epoch", "step", "lr", "train_loss", "val_loss",
+                  "val_mse", "val_mae", "val_cs", "val_psnr", "val_ssim", "val_ssim_legacy", "seconds"]
+    if not log_path.exists() or start_epoch == 0:
         with open(log_path, "w", newline="") as f:
-            csv.writer(f).writerow(["epoch", "loss", "seconds"])
+            csv.DictWriter(f, log_fields).writeheader()
 
-    amp = (torch.autocast("cuda", dtype=torch.bfloat16)
-           if args.amp and dev == "cuda" else contextlib.nullcontext())
+    train_start = time.time()
+    for epoch in range(start_epoch, config.EPOCHS):
+        epoch_start = time.time()
+        train_model.train()
+        running, count = 0.0, 0
 
-    for epoch in range(start, args.epochs):
-        ddpm.train()
-        t0, total, n = time.time(), 0.0, 0
-        for batch in loader:
-            ct = batch["ct"].to(dev, non_blocking=True)
-            mri = batch["mri"].to(dev, non_blocking=True)
-            with amp:
-                loss = ddpm.loss(mri, ct)
-            opt.zero_grad(set_to_none=True)
+        for batch in train_loader:
+            loss = diffusion_step(train_model, batch, scheduler, loss_fn, device)
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(ddpm.parameters(), 1.0)
-            opt.step()
-            ema_update(ema, ddpm, args.ema_decay)
-            total, n = total + loss.item(), n + 1
-        avg = total / max(n, 1)
-        print(f"epoch {epoch + 1}/{args.epochs}  loss {avg:.5f}  {time.time() - t0:.0f}s")
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP)
+            optimizer.step()
+            lr_scheduler.step()
+            ema.update(model)
+
+            running += loss.item()
+            count += 1
+            step += 1
+
+        row = {
+            "epoch": epoch,
+            "step": step,
+            "lr": lr_scheduler.get_last_lr()[0],
+            "train_loss": running / count,
+            "val_loss": validation_loss(train_model, test_loader, scheduler, loss_fn, device),
+        }
+
+        last_epoch = epoch == config.EPOCHS - 1
+        if (epoch + 1) % config.VAL_EVERY == 0 or last_epoch:
+            val = validation_samples(ema.model, test_loader.dataset, scheduler, device, epoch)
+            row.update({f"val_{k}": v for k, v in val.items()})
+            if val["mae"] < best_mae:
+                best_mae = val["mae"]
+                utils.save_checkpoint(config.CHECKPOINT_DIR / "best.pt", model, ema, optimizer,
+                                      lr_scheduler, epoch, step, best_mae)
+
+        row["seconds"] = time.time() - epoch_start
         with open(log_path, "a", newline="") as f:
-            csv.writer(f).writerow([epoch + 1, f"{avg:.6f}", f"{time.time() - t0:.1f}"])
+            csv.DictWriter(f, log_fields).writerow(row)
+        print(" | ".join(f"{k} {v:.5g}" if isinstance(v, float) else f"{k} {v}" for k, v in row.items()))
 
-        if (epoch + 1) % args.sample_every == 0:
-            k = min(4, len(test_ds))
-            ct = torch.stack([test_ds[i]["ct"] for i in range(k)]).to(dev)
-            gt = torch.stack([test_ds[i]["mri"] for i in range(k)])
-            pred = ema.ddim_sample(ct, steps=args.preview_steps).cpu()
-            save_preview(os.path.join(run_dir, "samples", f"epoch{epoch + 1:04d}.png"),
-                         ct.cpu(), gt, pred)
+        if (epoch + 1) % config.CKPT_EVERY == 0 or last_epoch:
+            utils.save_checkpoint(last_path, model, ema, optimizer, lr_scheduler, epoch, step, best_mae)
 
-        if (epoch + 1) % args.save_every == 0 or epoch + 1 == args.epochs:
-            tmp = ckpt_path + ".tmp"  # write-then-rename so a preempted job never leaves a half file
-            torch.save({"ddpm": ddpm.state_dict(), "ema": ema.state_dict(),
-                        "opt": opt.state_dict(), "epoch": epoch + 1, "args": vars(args)}, tmp)
-            os.replace(tmp, ckpt_path)
+    utils.save_checkpoint(config.CHECKPOINT_DIR / "final.pt", model, ema, optimizer, lr_scheduler,
+                          config.EPOCHS - 1, step, best_mae)
+    duration = time.time() - train_start
+    print(f"Training time: {duration:.2f} seconds")
+    (config.RUN_DIR / "train_time.txt").write_text(f"Training time: {duration:.2f} seconds\n")
 
 
 if __name__ == "__main__":

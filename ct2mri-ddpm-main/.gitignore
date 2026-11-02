@@ -1,0 +1,4 @@
+# __pycache__/ and *.pyc are covered by the repository-root .gitignore.
+runs/
+*.pt
+*.npz
